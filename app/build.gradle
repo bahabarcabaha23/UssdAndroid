@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace 'com.ussdcompanion.app'
-    compileSdk 33
+    compileSdk 34
 
     defaultConfig {
         applicationId "com.ussdcompanion.app"
