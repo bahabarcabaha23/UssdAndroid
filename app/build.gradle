@@ -4,20 +4,23 @@ plugins {
 }
 
 android {
-    ...
+    namespace 'com.ussdcompanion.app'
+    compileSdk 34
+
     defaultConfig {
         applicationId "com.ussdcompanion.app"
         minSdk 24
         targetSdk 34
-        versionCode 2  // <--- قم بتعديلها من 1 إلى 2
-        versionName "1.1" // <--- قم بتعديلها من 1.0 إلى 1.1
-        ...
+        versionCode 2
+        versionName "1.1"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
-}
 
     buildTypes {
         release {
             minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 
@@ -35,5 +38,5 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.11.0'
-    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    implementation 'fi.iki.elonen:nanohttpd:2.3.1'
 }
