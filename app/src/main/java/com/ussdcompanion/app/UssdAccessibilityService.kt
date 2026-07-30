@@ -6,15 +6,8 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * تراقب ظهور نافذة رد الـ USSD النظامية (تظهرها شاشة الاتصال عند طلب رمز مثل *123#)
- * وتقرأ نصها، وتكتشف إن كانت تنتظر إدخال المستخدم (قائمة متعددة الخطوات) أو أنها انتهت.
- *
- * لم يُحدَّد packageNames في accessibility_service_config.xml عمداً: تختلف حزمة تطبيق
- * الاتصال بين الشركات المصنّعة (خصوصاً هواوي/EMUI)، فبدل الاعتماد على اسم حزمة قد لا يكون
- * صحيحاً على جهازك، تعتمد الخدمة على محتوى النافذة نفسه (نص + عناصر تطابق نمط حوار USSD)
- * وعلى وجود جلسة نشطة بدأناها نحن أصلاً (UssdSessionState.status != IDLE) لتفادي التقاط
- * نوافذ أخرى غير متعلقة. إن لم تُكتشف النافذة بشكل صحيح على جهازك، سجل الأحداث في التطبيق
- * (الشاشة الرئيسية) يساعد في التشخيص والتعديل.
+ * تراقب ظهور نافذة رد الـ USSD النظامية وتستخرج النص
+ * وتدعم واجهات Huawei EMUI بإغلاق النافذة تلقائياً عبر ID الأزرار القياسية أو النصوص.
  */
 class UssdAccessibilityService : AccessibilityService() {
 
@@ -53,11 +46,16 @@ class UssdAccessibilityService : AccessibilityService() {
                 ActivityLog.add("رد USSD (بانتظار إدخال): $text")
             }
         } else {
-            val hasDismissButton = findButtonByText(root, listOf("OK", "موافق", "Cancel", "إلغاء", "Dismiss", "Close")) != null
-            if (hasDismissButton) {
+            // البحث عن زر الإغلاق بالـ ID أولاً (خصائص EMUI/Android) ثم بالأزرار النصية المقبولة
+            val dismissButton = findDismissButton(root)
+            
+            if (dismissButton != null || text.isNotEmpty()) {
                 UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
                 UssdSessionState.message = text
                 ActivityLog.add("رد USSD (نهائي): $text")
+
+                // إغلاق النافذة المنبثقة فوراً بالنقر البرمجي على زر OK / Dismiss
+                dismissButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             }
         }
     }
@@ -66,7 +64,7 @@ class UssdAccessibilityService : AccessibilityService() {
         val toSend = UssdSessionState.pendingInputToSend.getAndSet(null)
         if (toSend != null) {
             val field = findEditText(root)
-            val sendBtn = findButtonByText(root, listOf("Send", "SEND", "إرسال", "موافق", "OK"))
+            val sendBtn = findDismissButton(root) ?: findButtonByText(root, listOf("Send", "SEND", "إرسال", "موافق", "OK", "Ok"))
             if (field != null) {
                 val args = Bundle()
                 args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, toSend)
@@ -79,7 +77,7 @@ class UssdAccessibilityService : AccessibilityService() {
         }
 
         if (UssdSessionState.dismissRequested) {
-            val closeBtn = findButtonByText(root, listOf("Cancel", "CANCEL", "إلغاء", "Dismiss", "OK", "موافق"))
+            val closeBtn = findDismissButton(root)
             closeBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             UssdSessionState.dismissRequested = false
             ActivityLog.add("تم إغلاق حوار USSD")
@@ -104,8 +102,27 @@ class UssdAccessibilityService : AccessibilityService() {
         return null
     }
 
+    /**
+     * يبحث عن زر الإغلاق أولاً عبر معرّف النظام القياسي (android:id/button1)
+     * ثم عبر النصوص الشائعة في واجهات Huawei والأجهزة الأخرى.
+     */
+    private fun findDismissButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        // 1. البحث بواسطة المعرفات البرمجية لنظام أندرويد
+        val buttonIds = listOf("android:id/button1", "android:id/button2", "android:id/button3")
+        for (id in buttonIds) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (!nodes.isNullOrEmpty()) {
+                return nodes[0]
+            }
+        }
+
+        // 2. البحث بواسطة الكلمات النصية المرادفة لزر الإغلاق/الموافقة
+        val options = listOf("OK", "Ok", "ok", "موافق", "تم", "Cancel", "إلغاء", "Dismiss", "Close")
+        return findButtonByText(root, options)
+    }
+
     private fun findButtonByText(node: AccessibilityNodeInfo, options: List<String>): AccessibilityNodeInfo? {
-        val nodeText = node.text?.toString()
+        val nodeText = node.text?.toString()?.trim()
         if (nodeText != null && options.any { nodeText.equals(it, ignoreCase = true) }) return node
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
