@@ -39,6 +39,6 @@ dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.11.0'
     
-    // تعديل رقم إصدار المكتبة إلى 2.2.0 المستقر
-    implementation 'fi.iki.elonen:nanohttpd:2.2.0'
+    // استخدام Group ID الصحيح والموجود على Maven Central
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
 }
