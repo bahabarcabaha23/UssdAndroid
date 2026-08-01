@@ -28,14 +28,17 @@ import android.view.accessibility.AccessibilityNodeInfo
 class UssdAccessibilityService : AccessibilityService() {
 
     companion object {
-        private val DISMISS_BUTTON_TEXTS = listOf(
-            "OK", "Ok", "ok", "موافق", "Cancel", "CANCEL", "إلغاء", "Dismiss", "Close", "إغلاق"
-        )
-        private val SEND_BUTTON_TEXTS = listOf("Send", "SEND", "إرسال", "موافق", "OK")
-        private val STANDARD_DIALOG_BUTTON_IDS = listOf(
-            "android:id/button1", "android:id/button2", "android:id/button3"
-        )
-    }
+    private val DISMISS_BUTTON_TEXTS = listOf(
+        "OK", "Ok", "ok", "موافق", "Cancel", "CANCEL", "إلغاء", 
+        "Dismiss", "Close", "إغلاق", "ANNULER", "Annuler", "Fermer"
+    )
+    private val SEND_BUTTON_TEXTS = listOf(
+        "Send", "SEND", "إرسال", "موافق", "OK", "ENVOYER", "Envoyer"
+    )
+    private val STANDARD_DIALOG_BUTTON_IDS = listOf(
+        "android:id/button1", "android:id/button2", "android:id/button3"
+    )
+}
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
