@@ -28,17 +28,27 @@ import android.view.accessibility.AccessibilityNodeInfo
 class UssdAccessibilityService : AccessibilityService() {
 
     companion object {
-    private val DISMISS_BUTTON_TEXTS = listOf(
-        "OK", "Ok", "ok", "موافق", "Cancel", "CANCEL", "إلغاء", 
-        "Dismiss", "Close", "إغلاق", "ANNULER", "Annuler", "Fermer"
-    )
-    private val SEND_BUTTON_TEXTS = listOf(
-        "Send", "SEND", "إرسال", "موافق", "OK", "ENVOYER", "Envoyer"
-    )
-    private val STANDARD_DIALOG_BUTTON_IDS = listOf(
-        "android:id/button1", "android:id/button2", "android:id/button3"
-    )
-}
+        private val DISMISS_BUTTON_TEXTS = listOf(
+            "OK", "Ok", "ok", "موافق", "Cancel", "CANCEL", "إلغاء", "Dismiss", "Close", "إغلاق",
+            // فرنسية (تظهر على واجهات هواوي/EMUI بدل الإنجليزية أو العربية، مثال: Djezzy *766#)
+            "ANNULER", "Annuler", "annuler", "Fermer", "fermer"
+        )
+        private val SEND_BUTTON_TEXTS = listOf(
+            "Send", "SEND", "إرسال", "موافق", "OK",
+            "ENVOYER", "Envoyer", "envoyer"
+        )
+        private val STANDARD_DIALOG_BUTTON_IDS = listOf(
+            "android:id/button1", "android:id/button2", "android:id/button3"
+        )
+
+        // مؤشر على أن النص يحمل رداً حقيقياً على استعلام رصيد (رقم مقترن بعملة، أو كلمة SOLDE/رصيد)
+        // يُستخدم لعدم اعتبار حوار "تفاعلي الشكل" (فيه EditText وخيار "1:Plus de detail" كما عند
+        // Djezzy) بانتظار إدخال، بينما هو في الواقع رد نهائي وصل بنجاح.
+        private val BALANCE_PATTERN = Regex(
+            "(SOLDE|رصيد|Solde|Crédit|Credit)|(\\d[\\d.,]*\\s*(DA|دج))",
+            RegexOption.IGNORE_CASE
+        )
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
@@ -55,6 +65,13 @@ class UssdAccessibilityService : AccessibilityService() {
         if (UssdSessionState.status == UssdSessionState.STATUS_IDLE) return
 
         val root = rootInActiveWindow ?: return
+
+        // فحص event.packageName أعلاه لا يكفي وحده: هذا الفحص على حزمة الحدث المُطلِق فقط،
+        // بينما rootInActiveWindow يُقرأ لحظة المعالجة وقد يعود عندها لتطبيقنا نفسه (مثلاً أثناء
+        // انتظار applyPendingActions لتنفيذ طلب إغلاق معلّق تأخر بضع ثوانٍ). لذلك نتحقق أيضاً
+        // من حزمة الجذر الفعلي الذي سنقرأ محتواه قبل معاملته كنافذة USSD محتملة.
+        if (root.packageName == packageName) return
+
         try {
             handlePossibleUssdDialog(root)
             applyPendingActions(root)
@@ -72,8 +89,12 @@ class UssdAccessibilityService : AccessibilityService() {
         if (text.isEmpty() || text.length > 2000) return
 
         val hasInputField = findEditText(root) != null
+        val looksLikeBalanceReply = BALANCE_PATTERN.containsMatchIn(text)
 
-        if (hasInputField) {
+        // Djezzy تُرجع رصيدها الآن ضمن قائمة تفاعلية الشكل (فيها EditText وخيار
+        // "1:Plus de detail")، رغم أنها رد نهائي فعلياً. لا نعتبرها "بانتظار إدخال" إن كانت
+        // تحمل رصيداً واضحاً بالفعل، وإلا بقيت الجلسة عالقة رغم وصول الرصيد الصحيح من اللحظة الأولى.
+        if (hasInputField && !looksLikeBalanceReply) {
             if (UssdSessionState.status != UssdSessionState.STATUS_WAITING_USER_INPUT || UssdSessionState.message != text) {
                 UssdSessionState.status = UssdSessionState.STATUS_WAITING_USER_INPUT
                 UssdSessionState.message = text
@@ -83,15 +104,21 @@ class UssdAccessibilityService : AccessibilityService() {
         }
 
         val dismissButton = findDismissButton(root)
-        if (dismissButton != null) {
+        if (dismissButton != null || looksLikeBalanceReply) {
             // نحفظ الحالة والنص أولاً كي يصبحا متاحين فوراً عبر GET /ussd/response قبل أي نقر
             UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
             UssdSessionState.message = text
             ActivityLog.add("رد USSD (نهائي): $text")
 
-            // إغلاق تلقائي وفوري بعد الاستخراج مباشرة، بدل انتظار /ussd/dismiss من الكمبيوتر
-            val clicked = dismissButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            ActivityLog.add(if (clicked) "تم إغلاق حوار USSD تلقائياً" else "تعذّر النقر التلقائي على زر الإغلاق")
+            if (dismissButton != null) {
+                // إغلاق تلقائي وفوري بعد الاستخراج مباشرة، بدل انتظار /ussd/dismiss من الكمبيوتر
+                val clicked = dismissButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                ActivityLog.add(if (clicked) "تم إغلاق حوار USSD تلقائياً" else "تعذّر النقر التلقائي على زر الإغلاق")
+            } else {
+                // لم يُعثر على زر إغلاق في هذه اللحظة (الأزرار قد تكون لا تزال تُرسم)؛
+                // سيتم إغلاقه لاحقاً عبر applyPendingActions عند وصول /ussd/dismiss من الكمبيوتر
+                ActivityLog.add("تم استخراج الرصيد؛ بانتظار توفر زر إغلاق مناسب")
+            }
         }
     }
 
