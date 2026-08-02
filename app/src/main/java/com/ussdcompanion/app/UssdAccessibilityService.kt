@@ -48,6 +48,19 @@ class UssdAccessibilityService : AccessibilityService() {
             "(SOLDE|رصيد|Solde|Crédit|Credit)|(\\d[\\d.,]*\\s*(DA|دج))",
             RegexOption.IGNORE_CASE
         )
+
+        // إصلاح: الشق الثاني من BALANCE_PATTERN (مبلغ + عملة، بلا كلمة SOLDE/Crédit) كان
+        // يطابق أيضاً نصوص قوائم تأكيد واختيار حقيقية تذكر مبلغاً ضمن سؤالها، مثل
+        // "VOUS VOULEZ TRANSFERER 100 DA... 1:POUR CONFIRMER 2:POUR ANNULER" أو قائمة
+        // اختيار العروض "1: ...2000 Da  2: ...1500 Da...". كانت هذه تُصنَّف خطأً كرد نهائي
+        // ويُغلق حوارها تلقائياً (أحياناً بالنقر على زر ANNULER) قبل إرسال رقم التأكيد، فيصل
+        // رقم التأكيد لاحقاً كطلب USSD جديد مستقل وهو ليس شيفرة صالحة.
+        // الفارق الحقيقي بين رد الرصيد وهذه القوائم ليس ذكر المبلغ، بل عدد الخيارات المرقّمة:
+        // رد الرصيد يحمل خياراً اختيارياً واحداً لا نحتاج متابعته ("1:Plus de detail Bonus")،
+        // بينما قوائم التأكيد/الاختيار تحمل خيارين مرقّمين أو أكثر دائماً (1:...2:... أو أكثر).
+        // لذا: أي نص فيه خياران مرقّمان أو أكثر يُعامل كقائمة اختيار حقيقية بانتظار إدخال،
+        // بصرف النظر عمّا إذا كان BALANCE_PATTERN قد طابقه أيضاً بسبب ذكر مبلغ فيه.
+        private val MULTI_OPTION_MENU_PATTERN = Regex("""[1-9]\d?\s*:""")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -90,11 +103,14 @@ class UssdAccessibilityService : AccessibilityService() {
 
         val hasInputField = findEditText(root) != null
         val looksLikeBalanceReply = BALANCE_PATTERN.containsMatchIn(text)
+        val looksLikeMultiChoiceMenu = MULTI_OPTION_MENU_PATTERN.findAll(text).count() >= 2
 
         // Djezzy تُرجع رصيدها الآن ضمن قائمة تفاعلية الشكل (فيها EditText وخيار
         // "1:Plus de detail")، رغم أنها رد نهائي فعلياً. لا نعتبرها "بانتظار إدخال" إن كانت
         // تحمل رصيداً واضحاً بالفعل، وإلا بقيت الجلسة عالقة رغم وصول الرصيد الصحيح من اللحظة الأولى.
-        if (hasInputField && !looksLikeBalanceReply) {
+        // استثناء: إن كانت قائمة اختيار حقيقية بخيارين مرقّمين أو أكثر (looksLikeMultiChoiceMenu)
+        // فهي بالتأكيد بانتظار إدخال (تأكيد تحويل، اختيار عرض...)، حتى لو ذكرت مبلغاً بالدينار.
+        if (hasInputField && (looksLikeMultiChoiceMenu || !looksLikeBalanceReply)) {
             if (UssdSessionState.status != UssdSessionState.STATUS_WAITING_USER_INPUT || UssdSessionState.message != text) {
                 UssdSessionState.status = UssdSessionState.STATUS_WAITING_USER_INPUT
                 UssdSessionState.message = text
