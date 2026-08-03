@@ -130,13 +130,22 @@ class HttpServerService : Service() {
                 return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "code is required"))
             }
 
-            if (existingSessionId != null &&
-                existingSessionId == UssdSessionState.currentRequestId &&
-                UssdSessionState.status == UssdSessionState.STATUS_WAITING_USER_INPUT) {
-                // متابعة جلسة قائمة بالفعل: نرسل النص كإدخال بدل بدء مكالمة USSD جديدة
-                UssdSessionState.pendingInputToSend.set(code)
-                return jsonResponse(Response.Status.OK, JSONObject().put("requestId", existingSessionId))
-            }
+            // ابحث عن هذا الشرط داخل handleUssdSend:
+if (existingSessionId != null &&
+    existingSessionId == UssdSessionState.currentRequestId &&
+    UssdSessionState.status == UssdSessionState.STATUS_WAITING_USER_INPUT) {
+
+    // 🟢 1. أضف سطر اللوق هنا:
+    ActivityLog.add("[HTTP] تم استقبال كود التأكيد/المتابعة: $code للجلسة: $existingSessionId")
+
+    UssdSessionState.pendingInputToSend.set(code)
+
+    // 🟢 2. أضف الاستدعاء المباشر لخدمة الوصول هنا فوراً بعد وضع الكود:
+    UssdAccessibilityService.instance?.performPendingActionsDirectly() 
+        ?: ActivityLog.add("[HTTP] تنبيه: UssdAccessibilityService غير متوفرة!")
+
+    return jsonResponse(Response.Status.OK, JSONObject().put("requestId", existingSessionId))
+}
 
             if (UssdSessionState.status != UssdSessionState.STATUS_IDLE) {
                 return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "device busy"))
