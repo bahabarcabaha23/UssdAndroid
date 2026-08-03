@@ -28,6 +28,24 @@ import android.view.accessibility.AccessibilityNodeInfo
 class UssdAccessibilityService : AccessibilityService() {
 
     companion object {
+        @Volatile var instance: UssdAccessibilityService? = null
+        override fun onCreate() {
+    super.onCreate()
+    instance = this
+}
+
+override fun onDestroy() {
+    instance = null
+    super.onDestroy()
+}
+fun performPendingActionsDirectly() {
+    val root = rootInActiveWindow
+    if (root == null) {
+        ActivityLog.add("[إدخال] فشل: لا توجد نافذة نشطة (rootInActiveWindow == null)")
+        return
+    }
+    applyPendingActions(root)
+}
         private val DISMISS_BUTTON_TEXTS = listOf(
             "OK", "Ok", "ok", "موافق", "Cancel", "CANCEL", "إلغاء", "Dismiss", "Close", "إغلاق",
             // فرنسية (تظهر على واجهات هواوي/EMUI بدل الإنجليزية أو العربية، مثال: Djezzy *766#)
@@ -139,20 +157,44 @@ class UssdAccessibilityService : AccessibilityService() {
     }
 
     private fun applyPendingActions(root: AccessibilityNodeInfo) {
-        val toSend = UssdSessionState.pendingInputToSend.getAndSet(null)
-        if (toSend != null) {
-            val field = findEditText(root)
-            val sendBtn = findButtonByText(root, SEND_BUTTON_TEXTS)
-            if (field != null) {
-                val args = Bundle()
-                args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, toSend)
-                field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-                sendBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                ActivityLog.add("تم إرسال الإدخال: $toSend")
-            } else {
-                ActivityLog.add("تعذّر العثور على حقل الإدخال لإرسال: $toSend")
+    val toSend = UssdSessionState.pendingInputToSend.getAndSet(null)
+    if (toSend != null) {
+        val field = findEditText(root)
+        val sendBtn = findButtonByText(root, SEND_BUTTON_TEXTS)
+        
+        if (field != null) {
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, toSend)
             }
+            
+            // تسجيل نتيجة كتابة النص
+            val setTextSuccess = field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            ActivityLog.add("[إدخال] نتيجة كتابة النص ('$toSend'): $setTextSuccess")
+
+            if (setTextSuccess && sendBtn != null) {
+                // تسجيل نتيجة الضغط على زر الإرسال
+                val clickSuccess = sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                ActivityLog.add("[إدخال] نتيجة الضغط على زر الإرسال: $clickSuccess")
+
+                if (clickSuccess) {
+                    UssdSessionState.status = UssdSessionState.STATUS_PENDING
+                }
+            } else if (sendBtn == null) {
+                ActivityLog.add("[إدخال] فشل: لم يُعثر على زر الإرسال (ENVOYER)")
+            }
+        } else {
+            ActivityLog.add("[إدخال] فشل: لم يُعثر على حقل الإدخال (EditText)")
         }
+    }
+
+    // طلب الإغلاق إن وجد
+    if (UssdSessionState.dismissRequested) {
+        val closeBtn = findDismissButton(root)
+        val clicked = closeBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
+        ActivityLog.add(if (clicked) "تم إغلاق حوار USSD بطلب من البرنامج" else "طلب إغلاق لكن لم يُعثر على زر مناسب")
+        UssdSessionState.reset()
+    }
+}
 
         // طلب إغلاق صريح من الكمبيوتر (POST /ussd/dismiss) - غالباً لإلغاء جلسة عالقة بانتظار إدخال
         if (UssdSessionState.dismissRequested) {
