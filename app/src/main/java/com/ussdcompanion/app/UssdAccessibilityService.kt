@@ -198,7 +198,8 @@ class UssdAccessibilityService : AccessibilityService() {
     }
 
     private fun findButtonByText(node: AccessibilityNodeInfo, options: List<String>): AccessibilityNodeInfo? {
-        val nodeText = node.text?.toString()
+        // 🟢 إضافة trim() لإزالة أي مسافات فارغة قد تمنع التطابق
+        val nodeText = node.text?.toString()?.trim()
         if (nodeText != null && options.any { nodeText.equals(it, ignoreCase = true) }) return node
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
