@@ -186,13 +186,12 @@ if (existingSessionId != null &&
             return jsonResponse(Response.Status.OK, json)
         }
 
-        private fun handleUssdDismiss(): Response {
-            // ملاحظة إصلاح: كان هذا الموضع يستدعي UssdSessionState.reset() فوراً بعد رفع
-            // العلم، فيصفّر status إلى IDLE قبل أن تصل خدمة الوصول لحدثها التالي - ما يجعل
-            // onAccessibilityEvent يتجاهل الجلسة فوراً (status == IDLE) ولا تُنقر زر
-            // الإغلاق فعلياً على الشاشة أبداً. الآن: نكتفي برفع العلم هنا، وخدمة الوصول
-            // (applyPendingActions) هي من تستدعي reset() بعد محاولة النقر الفعلية.
+       private fun handleUssdDismiss(): Response {
             UssdSessionState.dismissRequested = true
+            
+            // 🟢 إجبار خدمة الوصول على تنفيذ أمر الإغلاق فوراً دون انتظار تغير الشاشة
+            UssdAccessibilityService.instance?.performPendingActionsDirectly()
+            
             return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
         }
 
