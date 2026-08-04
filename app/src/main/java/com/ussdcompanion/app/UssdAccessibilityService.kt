@@ -26,7 +26,7 @@ class UssdAccessibilityService : AccessibilityService() {
             "android:id/button1", "android:id/button2", "android:id/button3"
         )
 
-        // 🟢 الكلمات المفتاحية لتجاهل نوافذ تحميل الأندرويد المؤقتة
+        // الكلمات المفتاحية لتجاهل نوافذ تحميل الأندرويد المؤقتة
         private val IGNORED_SYSTEM_MESSAGES = listOf(
             "ussd code running",
             "exécution du code ussd",
@@ -61,11 +61,23 @@ class UssdAccessibilityService : AccessibilityService() {
             return
         }
 
+        // تجاهل الأحداث الصادرة من تطبيقنا نفسه
         if (event.packageName == packageName) return
         if (UssdSessionState.status == UssdSessionState.STATUS_IDLE) return
 
         val root = rootInActiveWindow ?: return
         if (root.packageName == packageName) return
+
+        // 🛡️ فلترة الأمان: التأكد من أن النافذة تنتمي للنظام أو تطبيق الاتصال
+        val currentPackageName = root.packageName?.toString()?.lowercase() ?: ""
+        val isTelephonyPackage = currentPackageName.contains("telephony") || 
+                                 currentPackageName.contains("phone") || 
+                                 currentPackageName.contains("server.telecom") ||
+                                 currentPackageName == "android"
+
+        if (!isTelephonyPackage) {
+            return // تجاهل أي نافذة لا تتعلق بالاتصالات
+        }
 
         try {
             handlePossibleUssdDialog(root)
@@ -83,10 +95,14 @@ class UssdAccessibilityService : AccessibilityService() {
         val text = allText.toString().trim()
         if (text.isEmpty() || text.length > 2000) return
 
-        // 🟢 فلترة رسائل النظام المؤقتة لتفادي الإنهاء المبكر للجلسة
+        // 🟢 فلترة رسائل النظام المؤقتة (التحميل) لتفادي الإنهاء المبكر
         val lowerText = text.lowercase()
-        if (IGNORED_SYSTEM_MESSAGES.any { lowerText.contains(it) }) {
-            return // نتجاهل هذه النافذة كلياً وننتظر الرد الحقيقي من الشبكة
+        val isSystemMessage = IGNORED_SYSTEM_MESSAGES.any { lowerText.contains(it) }
+        val isLoadingProgress = hasProgressIndicator(root)
+
+        if (isSystemMessage || isLoadingProgress) {
+            ActivityLog.add("تم تجاهل نافذة تحميل مؤقتة بانتظار الرد الفعلي من الشبكة.")
+            return 
         }
 
         val hasInputField = findEditText(root) != null
@@ -150,6 +166,16 @@ class UssdAccessibilityService : AccessibilityService() {
             ActivityLog.add(if (clicked) "تم إغلاق حوار USSD بطلب من البرنامج" else "طلب إغلاق لكن لم يُعثر على زر مناسب")
             UssdSessionState.reset()
         }
+    }
+
+    // 🟢 التحقق المادي من وجود مؤشر تحميل (ProgressBar)
+    private fun hasProgressIndicator(node: AccessibilityNodeInfo): Boolean {
+        if (node.className == "android.widget.ProgressBar") return true
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (hasProgressIndicator(child)) return true
+        }
+        return false
     }
 
     private fun findDismissButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
