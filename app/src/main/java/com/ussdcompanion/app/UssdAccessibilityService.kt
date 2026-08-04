@@ -1,219 +1,211 @@
 package com.ussdcompanion.app
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.os.Bundle
-import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
+/**
+ * تراقب ظهور نافذة رد الـ USSD النظامية وتتعامل مع الإدخال والإغلاق التلقائي.
+ */
 class UssdAccessibilityService : AccessibilityService() {
 
     companion object {
-        private const val TAG = "USSD_ACCESSIBILITY"
-
-        @Volatile
+        @Volatile 
         var instance: UssdAccessibilityService? = null
-            private set
 
-        // حالة الجلسة الحالية لاستخدامها من قبل الخادم المحلي (HTTP Server)
-        var activeRequestId: String? = null
-        var lastUssdResponse: String? = null
-        var lastUssdStatus: String = "IDLE" // IDLE, WAITING_USER_INPUT, COMPLETED, ERROR
+        private val DISMISS_BUTTON_TEXTS = listOf(
+            "OK", "Ok", "ok", "موافق", "Cancel", "CANCEL", "إلغاء", "Dismiss", "Close", "إغلاق",
+            "ANNULER", "Annuler", "annuler", "Fermer", "fermer"
+        )
+        private val SEND_BUTTON_TEXTS = listOf(
+            "Send", "SEND", "إرسال", "موافق", "OK",
+            "ENVOYER", "Envoyer", "envoyer"
+        )
+        private val STANDARD_DIALOG_BUTTON_IDS = listOf(
+            "android:id/button1", "android:id/button2", "android:id/button3"
+        )
+
+        // لم نعد بحاجة لـ BALANCE_PATTERN و MULTI_OPTION_MENU_PATTERN المعقدة
     }
 
-    override fun onServiceConnected() {
-        super.onServiceConnected()
+    override fun onCreate() {
+        super.onCreate()
         instance = this
-        Log.d(TAG, "تم تشغيل خدمة USSD Accessibility بنجاح")
-
-        serviceInfo = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-            feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
-        }
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-
-        val root = rootInActiveWindow ?: return
-
-        // التحقق من أن النافذة النشطة تنتمي لحوار USSD
-        if (!isUssdDialog(event, root)) return
-
-        val text = extractText(root)
-        Log.d(TAG, "الحديث الملتقط من النافذة:\n$text")
-
-        // 🟢 الاعتماد المباشر على البنية: هل يوجد حقل إدخال EditText؟
-        val inputNode = findEditText(root)
-        val hasInputField = inputNode != null
-
-        if (hasInputField) {
-            // 🟢 WAITING_USER_INPUT: الشبكة تنتظر رداً (مثل 1 للتأكيد)
-            Log.d(TAG, "🟢 تم اكتشاف حقل إدخال -> الجلسة في حالة WAITING_USER_INPUT")
-            lastUssdResponse = text
-            lastUssdStatus = "WAITING_USER_INPUT"
-
-            // نترك النافذة مفتوحة على الشاشة لكي يتمكن كود C# من إرسال الرد (مثل 1)
-        } else {
-            // 🔴 COMPLETED: إشعار نهائي (مثل نجاح التعبئة أو نفاد الرصيد)
-            Log.d(TAG, "🔴 لا يوجد حقل إدخال -> الجلسة في حالة COMPLETED")
-            lastUssdResponse = text
-            lastUssdStatus = "COMPLETED"
-
-            // إغلاق النافذة تلقائياً لتنظيف الشاشة
-            val dismissBtn = findDismissButton(root)
-            dismissBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        }
-    }
-
-    /**
-     * تُستدعى من خادم الـ HTTP المحلي للتطبيق عندما يرسل تطبيق C# كود الإدخال (مثلاً "1")
-     */
-    fun sendInputToDialog(input: String): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val inputNode = findEditText(root) ?: return false
-
-        // 1. كتابة النص داخل حقل الإدخال
-        val arguments = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, input)
-        }
-        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
-
-        if (!textSet) {
-            Log.e(TAG, "فشل كتابة النص في حقل الإدخال")
-            return false
-        }
-
-        // 2. الضغط على زر الإرسال (ENVOYER / SEND / OK)
-        val sendBtn = findSendButton(root)
-        return if (sendBtn != null) {
-            sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        } else {
-            Log.e(TAG, "لم يتم العثور على زر الإرسال")
-            false
-        }
-    }
-
-    /**
-     * إلغاء وإغلاق حوار USSD اليدوي عند الحاجة
-     */
-    fun dismissDialog(): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val dismissBtn = findDismissButton(root)
-        return dismissBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
-    }
-
-    // =========================================================
-    // الدوال المساعدة للبحث واستخراج العناصر من الشاشة
-    // =========================================================
-
-    private fun isUssdDialog(event: AccessibilityEvent, root: AccessibilityNodeInfo): Boolean {
-        val packageName = event.packageName?.toString() ?: ""
-        val isTelephonyPackage = packageName.contains("telephony") ||
-                packageName.contains("phone") ||
-                packageName.contains("android")
-
-        val hasUssdElements = findDismissButton(root) != null || findEditText(root) != null
-        return isTelephonyPackage && hasUssdElements
-    }
-
-    private fun findEditText(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
-
-        if (node.className == "android.widget.EditText") {
-            return node
-        }
-
-        val nodesById = node.findAccessibilityNodeInfosByViewId("android:id/input")
-        if (!nodesById.isNullOrEmpty()) {
-            return nodesById[0]
-        }
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i)
-            val result = findEditText(child)
-            if (result != null) return result
-        }
-
-        return null
-    }
-
-    private fun findSendButton(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
-
-        val sendKeywords = listOf("ENVOYER", "SEND", "ارسال", "إرسال", "OK")
-        for (keyword in sendKeywords) {
-            val nodes = node.findAccessibilityNodeInfosByText(keyword)
-            if (!nodes.isNullOrEmpty()) {
-                for (n in nodes) {
-                    if (n.isClickable) return n
-                }
-            }
-        }
-
-        val nodesById = node.findAccessibilityNodeInfosByViewId("android:id/button1")
-        if (!nodesById.isNullOrEmpty() && nodesById[0].isClickable) {
-            return nodesById[0]
-        }
-
-        return null
-    }
-
-    private fun findDismissButton(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
-
-        val dismissKeywords = listOf("ANNULER", "CANCEL", "إلغاء", "DISMISS", "FERMER")
-        for (keyword in dismissKeywords) {
-            val nodes = node.findAccessibilityNodeInfosByText(keyword)
-            if (!nodes.isNullOrEmpty()) {
-                for (n in nodes) {
-                    if (n.isClickable) return n
-                }
-            }
-        }
-
-        val nodesById = node.findAccessibilityNodeInfosByViewId("android:id/button2")
-        if (!nodesById.isNullOrEmpty() && nodesById[0].isClickable) {
-            return nodesById[0]
-        }
-
-        return null
-    }
-
-    private fun extractText(node: AccessibilityNodeInfo?): String {
-        if (node == null) return ""
-        val sb = StringBuilder()
-
-        fun traverse(n: AccessibilityNodeInfo) {
-            if (n.className == "android.widget.TextView" && !n.text.isNullOrEmpty()) {
-                val txt = n.text.toString().trim()
-                if (txt.isNotEmpty() && !isButtonText(txt)) {
-                    sb.append(txt).append("\n")
-                }
-            }
-            for (i in 0 until n.childCount) {
-                n.getChild(i)?.let { traverse(it) }
-            }
-        }
-
-        traverse(node)
-        return sb.toString().trim()
-    }
-
-    private fun isButtonText(text: String): Boolean {
-        val buttonTexts = listOf("ENVOYER", "SEND", "ارسال", "إرسال", "ANNULER", "CANCEL", "إلغاء")
-        return buttonTexts.any { it.equals(text, ignoreCase = true) }
-    }
-
-    override fun onInterrupt() {
-        Log.w(TAG, "انقطع اتصال خدمة Accessibility")
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         instance = null
-        Log.d(TAG, "تم توقيف خدمة USSD Accessibility")
+        super.onDestroy()
+    }
+
+    /**
+     * تُستدعى مباشرة من HttpServerService عند استقبال كود التتابع/التأكيد
+     */
+    fun performPendingActionsDirectly() {
+        val root = rootInActiveWindow
+        if (root == null) {
+            ActivityLog.add("[إدخال] فشل: لا توجد نافذة نشطة (rootInActiveWindow == null)")
+            return
+        }
+        applyPendingActions(root)
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent) {
+        if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+            event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+            return
+        }
+
+        if (event.packageName == packageName) return
+        if (UssdSessionState.status == UssdSessionState.STATUS_IDLE) return
+
+        val root = rootInActiveWindow ?: return
+        if (root.packageName == packageName) return
+
+        try {
+            handlePossibleUssdDialog(root)
+            applyPendingActions(root)
+        } catch (e: Exception) {
+            ActivityLog.add("خطأ أثناء قراءة نافذة USSD: ${e.message}")
+        }
+    }
+
+    private fun handlePossibleUssdDialog(root: AccessibilityNodeInfo) {
+        if (UssdSessionState.status == UssdSessionState.STATUS_COMPLETED) return
+
+        val allText = StringBuilder()
+        collectText(root, allText)
+        val text = allText.toString().trim()
+        if (text.isEmpty() || text.length > 2000) return
+
+        // =========================================================
+        // 🟢 التعديل الجديد: الاعتماد فقط على وجود حقل الإدخال
+        // =========================================================
+        val hasInputField = findEditText(root) != null
+
+        if (hasInputField) {
+            // بانتظار إدخال
+            if (UssdSessionState.status != UssdSessionState.STATUS_WAITING_USER_INPUT || UssdSessionState.message != text) {
+                UssdSessionState.status = UssdSessionState.STATUS_WAITING_USER_INPUT
+                UssdSessionState.message = text
+                ActivityLog.add("رد USSD (بانتظار إدخال): $text")
+            }
+            return
+        } else {
+            // نهائي
+            UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
+            UssdSessionState.message = text
+            ActivityLog.add("رد USSD (نهائي): $text")
+
+            val dismissButton = findDismissButton(root)
+            if (dismissButton != null) {
+                val clicked = dismissButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                ActivityLog.add(if (clicked) "تم إغلاق حوار USSD تلقائياً" else "تعذّر النقر التلقائي على زر الإغلاق")
+            } else {
+                ActivityLog.add("تم استخراج الرد؛ بانتظار توفر زر إغلاق مناسب")
+            }
+        }
+        // =========================================================
+    }
+
+    private fun applyPendingActions(root: AccessibilityNodeInfo) {
+        val toSend = UssdSessionState.pendingInputToSend.getAndSet(null)
+        if (toSend != null) {
+            val field = findEditText(root)
+            val sendBtn = findButtonByText(root, SEND_BUTTON_TEXTS)
+            
+            if (field != null) {
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, toSend)
+                }
+                
+                // تسجيل نتيجة كتابة النص
+                val setTextSuccess = field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                ActivityLog.add("[إدخال] نتيجة كتابة النص ('$toSend'): $setTextSuccess")
+
+                if (setTextSuccess && sendBtn != null) {
+                    // تسجيل نتيجة الضغط على زر الإرسال
+                    val clickSuccess = sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    ActivityLog.add("[إدخال] نتيجة الضغط على زر الإرسال: $clickSuccess")
+
+                    if (clickSuccess) {
+                        UssdSessionState.status = UssdSessionState.STATUS_PENDING
+                    }
+                } else if (sendBtn == null) {
+                    ActivityLog.add("[إدخال] فشل: لم يُعثر على زر الإرسال (ENVOYER)")
+                }
+            } else {
+                ActivityLog.add("[إدخال] فشل: لم يُعثر على حقل الإدخال (EditText)")
+            }
+        }
+
+        // طلب إغلاق صريح من الكمبيوتر (POST /ussd/dismiss)
+        if (UssdSessionState.dismissRequested) {
+            val closeBtn = findDismissButton(root)
+            val clicked = closeBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
+            ActivityLog.add(if (clicked) "تم إغلاق حوار USSD بطلب من البرنامج" else "طلب إغلاق لكن لم يُعثر على زر مناسب")
+            UssdSessionState.reset()
+        }
+    }
+
+    private fun findDismissButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        for (viewId in STANDARD_DIALOG_BUTTON_IDS) {
+            val found = try {
+                root.findAccessibilityNodeInfosByViewId(viewId)?.firstOrNull { it.isEnabled }
+            } catch (e: Exception) {
+                null
+            }
+            if (found != null) return found
+        }
+
+        findButtonByText(root, DISMISS_BUTTON_TEXTS)?.let { return it }
+
+        val buttons = mutableListOf<AccessibilityNodeInfo>()
+        collectButtons(root, buttons)
+        if (buttons.size == 1) return buttons[0]
+
+        return null
+    }
+
+    private fun collectButtons(node: AccessibilityNodeInfo, out: MutableList<AccessibilityNodeInfo>) {
+        if (node.className == "android.widget.Button") out.add(node)
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectButtons(child, out)
+        }
+    }
+
+    private fun collectText(node: AccessibilityNodeInfo, out: StringBuilder) {
+        node.text?.let { if (it.isNotBlank()) out.append(it).append(" ") }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectText(child, out)
+        }
+    }
+
+    private fun findEditText(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (node.className == "android.widget.EditText") return node
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val found = findEditText(child)
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun findButtonByText(node: AccessibilityNodeInfo, options: List<String>): AccessibilityNodeInfo? {
+        val nodeText = node.text?.toString()
+        if (nodeText != null && options.any { nodeText.equals(it, ignoreCase = true) }) return node
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val found = findButtonByText(child, options)
+            if (found != null) return found
+        }
+        return null
+    }
+
+    override fun onInterrupt() {
+        ActivityLog.add("تم إيقاف خدمة الوصول")
     }
 }
