@@ -84,18 +84,32 @@ class UssdAccessibilityService : AccessibilityService() {
         val text = allText.toString().trim()
         if (text.isEmpty() || text.length > 2000) return
 
-        val hasInputField = findEditText(root) != null
-        val looksLikeBalanceReply = BALANCE_PATTERN.containsMatchIn(text)
-        val looksLikeMultiChoiceMenu = MULTI_OPTION_MENU_PATTERN.findAll(text).count() >= 2
+       // التحقق من وجود حقل الإدخال فقط
+val hasInputField = findEditText(root) != null
 
-        if (hasInputField && (looksLikeMultiChoiceMenu || !looksLikeBalanceReply)) {
-            if (UssdSessionState.status != UssdSessionState.STATUS_WAITING_USER_INPUT || UssdSessionState.message != text) {
-                UssdSessionState.status = UssdSessionState.STATUS_WAITING_USER_INPUT
-                UssdSessionState.message = text
-                ActivityLog.add("رد USSD (بانتظار إدخال): $text")
-            }
-            return
-        }
+if (hasInputField) {
+    // 🟢 بانتظار إدخال (WAITING_USER_INPUT)
+    // الشبكة تطلب رداً حتماً، سواء كان النص يحتوي على رصيد، قائمة، أو غيره.
+    Log.d("USSD_SERVICE", "تم اكتشاف حقل إدخال -> الجلسة تنتظر رد المستخدم.")
+    
+    // إرسال الحالة إلى C# أو الاستمرار في معالجة الجلسة
+    handleSessionWaitingForInput(node) 
+} else {
+    // 🔴 نهائي (COMPLETED)
+    // لا يوجد حقل إدخال، هذه رسالة إشعارية فقط (مثل: نجاح التعبئة، أو الرصيد غير كافٍ)
+    Log.d("USSD_SERVICE", "لا يوجد حقل إدخال -> رسالة نهائية.")
+    
+    // استخراج النص لرفعه إلى C#
+    val responseText = extractText(root)
+    
+    if (dismissButton != null) {
+        // إغلاق الحوار لتنظيف الشاشة
+        dismissButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+    }
+    
+    // إبلاغ الخادم أن الجلسة انتهت
+    handleSessionCompleted(responseText)
+}
 
         val dismissButton = findDismissButton(root)
         if (dismissButton != null || looksLikeBalanceReply) {
