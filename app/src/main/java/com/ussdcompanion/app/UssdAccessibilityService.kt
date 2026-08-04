@@ -26,7 +26,14 @@ class UssdAccessibilityService : AccessibilityService() {
             "android:id/button1", "android:id/button2", "android:id/button3"
         )
 
-        // لم نعد بحاجة لـ BALANCE_PATTERN و MULTI_OPTION_MENU_PATTERN المعقدة
+        // 🟢 الكلمات المفتاحية لتجاهل نوافذ تحميل الأندرويد المؤقتة
+        private val IGNORED_SYSTEM_MESSAGES = listOf(
+            "ussd code running",
+            "exécution du code ussd",
+            "execution du code ussd",
+            "رمز ussd قيد التشغيل",
+            "يتم تشغيل رمز ussd"
+        )
     }
 
     override fun onCreate() {
@@ -39,9 +46,6 @@ class UssdAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
-    /**
-     * تُستدعى مباشرة من HttpServerService عند استقبال كود التتابع/التأكيد
-     */
     fun performPendingActionsDirectly() {
         val root = rootInActiveWindow
         if (root == null) {
@@ -79,9 +83,12 @@ class UssdAccessibilityService : AccessibilityService() {
         val text = allText.toString().trim()
         if (text.isEmpty() || text.length > 2000) return
 
-        // =========================================================
-        // 🟢 التعديل الجديد: الاعتماد فقط على وجود حقل الإدخال
-        // =========================================================
+        // 🟢 فلترة رسائل النظام المؤقتة لتفادي الإنهاء المبكر للجلسة
+        val lowerText = text.lowercase()
+        if (IGNORED_SYSTEM_MESSAGES.any { lowerText.contains(it) }) {
+            return // نتجاهل هذه النافذة كلياً وننتظر الرد الحقيقي من الشبكة
+        }
+
         val hasInputField = findEditText(root) != null
 
         if (hasInputField) {
@@ -106,7 +113,6 @@ class UssdAccessibilityService : AccessibilityService() {
                 ActivityLog.add("تم استخراج الرد؛ بانتظار توفر زر إغلاق مناسب")
             }
         }
-        // =========================================================
     }
 
     private fun applyPendingActions(root: AccessibilityNodeInfo) {
@@ -120,12 +126,10 @@ class UssdAccessibilityService : AccessibilityService() {
                     putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, toSend)
                 }
                 
-                // تسجيل نتيجة كتابة النص
                 val setTextSuccess = field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                 ActivityLog.add("[إدخال] نتيجة كتابة النص ('$toSend'): $setTextSuccess")
 
                 if (setTextSuccess && sendBtn != null) {
-                    // تسجيل نتيجة الضغط على زر الإرسال
                     val clickSuccess = sendBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                     ActivityLog.add("[إدخال] نتيجة الضغط على زر الإرسال: $clickSuccess")
 
@@ -140,7 +144,6 @@ class UssdAccessibilityService : AccessibilityService() {
             }
         }
 
-        // طلب إغلاق صريح من الكمبيوتر (POST /ussd/dismiss)
         if (UssdSessionState.dismissRequested) {
             val closeBtn = findDismissButton(root)
             val clicked = closeBtn?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
