@@ -87,6 +87,7 @@ class HttpServerService : Service() {
                     uri.startsWith("/ussd/dismiss/") && session.method == Method.POST -> handleUssdDismiss()
                     uri == "/sms/list" && session.method == Method.GET -> handleSmsList(session)
                     uri == "/sms/delete" && session.method == Method.DELETE -> handleSmsDelete()
+                    uri == "/sms/wait" && session.method == Method.POST -> handleSmsWait(session)
                     else -> jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
                 }
             } catch (e: Exception) {
@@ -225,6 +226,92 @@ if (existingSessionId != null &&
                 Response.Status.BAD_REQUEST,
                 JSONObject().put("error", "sms delete not enabled in this build - see README")
             )
+        }
+
+        // =========================================================
+        // 🟢 جديد: POST /sms/wait — ينتظر رسالة SMS جديدة عند الطلب الصريح من C#
+        // لا يُشغَّل تلقائياً بعد USSD، ولا يحلل نجاح/فشل — يعيد النص الخام فقط.
+        // القرار (نجاح/فشل التعبئة) يبقى بالكامل من مسؤولية تطبيق C#.
+        // =========================================================
+        private fun handleSmsWait(session: IHTTPSession): Response {
+            if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
+                return jsonResponse(
+                    Response.Status.OK,
+                    JSONObject()
+                        .put("status", "failed")
+                        .put("body", "READ_SMS permission not granted")
+                        .put("sender", "")
+                        .put("date", "")
+                )
+            }
+
+            val files = HashMap<String, String>()
+            try {
+                session.parseBody(files)
+            } catch (e: Exception) {
+                // جسم فارغ مقبول (كل القيم افتراضية)
+            }
+            val body = JSONObject(files["postData"] ?: "{}")
+            val senderFilter = body.optString("sender", "").trim()
+            val timeoutSeconds = body.optInt("timeout", 50).coerceIn(1, 120)
+
+            val requestReceivedAtMs = System.currentTimeMillis()
+            val deadlineMs = requestReceivedAtMs + timeoutSeconds * 1000L
+            val pollIntervalMs = 1500L
+
+            ActivityLog.add(
+                "[SMS] بدء انتظار رسالة جديدة" +
+                    (if (senderFilter.isNotEmpty()) " من: $senderFilter" else "") +
+                    " (حتى $timeoutSeconds ث)"
+            )
+
+            while (System.currentTimeMillis() < deadlineMs) {
+                val newMsg = findNewSmsSince(requestReceivedAtMs, senderFilter)
+                if (newMsg != null) {
+                    ActivityLog.add("[SMS] وصلت رسالة جديدة من ${newMsg.optString("address")}")
+                    return jsonResponse(
+                        Response.Status.OK,
+                        JSONObject()
+                            .put("status", "success")
+                            .put("body", newMsg.optString("body"))
+                            .put("sender", newMsg.optString("address"))
+                            .put("date", newMsg.optString("date"))
+                    )
+                }
+                try {
+                    Thread.sleep(pollIntervalMs)
+                } catch (e: InterruptedException) {
+                    break
+                }
+            }
+
+            ActivityLog.add("[SMS] انتهت مهلة الانتظار ($timeoutSeconds ث) بدون وصول رسالة جديدة")
+            return jsonResponse(
+                Response.Status.OK,
+                JSONObject().put("status", "timeout").put("body", "").put("sender", "").put("date", "")
+            )
+        }
+
+        /** يبحث عن أحدث رسالة وصلت بعد sinceMs (بالميلي ثانية)، وتحتوي senderFilter ضمن رقم المرسل إن وُجد. */
+        private fun findNewSmsSince(sinceMs: Long, senderFilter: String): JSONObject? {
+            val uri = Uri.parse("content://sms/inbox")
+            val cursor: Cursor? = context.contentResolver.query(
+                uri, arrayOf("_id", "address", "body", "date"), null, null, "date DESC LIMIT 20"
+            )
+            cursor?.use {
+                while (it.moveToNext()) {
+                    val date = it.getLong(3)
+                    if (date <= sinceMs) continue // رسالة قديمة (الترتيب تنازلي، الأحدث أولاً)
+                    val address = it.getString(1) ?: ""
+                    if (senderFilter.isNotEmpty() && !address.contains(senderFilter, ignoreCase = true)) continue
+                    return JSONObject()
+                        .put("id", it.getInt(0))
+                        .put("address", address)
+                        .put("body", it.getString(2) ?: "")
+                        .put("date", date.toString())
+                }
+            }
+            return null
         }
 
         private fun getBatteryLevel(): Int {
