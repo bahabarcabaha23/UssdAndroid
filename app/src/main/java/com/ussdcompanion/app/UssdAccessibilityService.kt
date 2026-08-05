@@ -1,9 +1,12 @@
 package com.ussdcompanion.app
 
 import android.accessibilityservice.AccessibilityService
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.content.ContextCompat
 
 /**
  * تراقب ظهور نافذة رد الـ USSD النظامية وتتعامل مع الإدخال والإغلاق التلقائي.
@@ -34,6 +37,26 @@ class UssdAccessibilityService : AccessibilityService() {
             "رمز ussd قيد التشغيل",
             "يتم تشغيل رمز ussd"
         )
+
+        // ⚠️ نمط تقريبي للتعرف على "إشعار الرصيد سيصل عبر SMS" (استعلام رصيد موبيليس).
+        // لم يُتوفّر لدي نص الرسالة الحقيقي بعد - اضبط هذا النمط بدقة بمجرد تنفيذ طلب رصيد فعلي
+        // ومراجعة نص الرد الذي سيظهر في سجل الأحداث تحت "رد USSD (نهائي):" قبل هذا التعديل.
+        private val BALANCE_VIA_SMS_PATTERN = Regex(
+            "(solde|crédit|credit|رصيد).{0,80}(sms)|(sms).{0,80}(solde|crédit|credit|رصيد)",
+            RegexOption.IGNORE_CASE
+        )
+        // استثناء متعمّد: رسالة تأكيد التعبئة "Votre demande est prise en charge, un sms vous sera
+        // envoyé" تحتوي أيضاً على كلمة sms، لكنها تخص تدفّق التعبئة (تُعالَج في C# بآلية منفصلة بالفعل)
+        // وليست استعلام رصيد - يجب ألا تدخل هذا المسار الجديد إطلاقاً.
+        private val RECHARGE_NOTIFICATION_EXCLUSIONS = Regex(
+            "recharger|recharge|prise en charge|transaction|transferer|transférer",
+            RegexOption.IGNORE_CASE
+        )
+        // نمط استخراج قيمة الرصيد من نص رسالة الـ SMS الواردة (مبلغ متبوع بـ DA أو دج)
+        private val BALANCE_VALUE_PATTERN = Regex("""(\d+[.,]?\d*)\s*(DA|دج)""", RegexOption.IGNORE_CASE)
+
+        private const val BALANCE_SMS_WAIT_MS = 40_000L
+        private const val SMS_POLL_INTERVAL_MS = 2_000L
     }
 
     override fun onCreate() {
@@ -88,7 +111,10 @@ class UssdAccessibilityService : AccessibilityService() {
     }
 
     private fun handlePossibleUssdDialog(root: AccessibilityNodeInfo) {
-        if (UssdSessionState.status == UssdSessionState.STATUS_COMPLETED) return
+        // أثناء انتظار رسالة الرصيد، الحوار الأصلي مُغلق فعلاً والخيط الخلفي هو من يتحكم بالحالة -
+        // يجب ألا تُعاد معالجة أي نافذة أخرى تظهر عرَضياً في هذه الأثناء.
+        if (UssdSessionState.status == UssdSessionState.STATUS_COMPLETED ||
+            UssdSessionState.status == UssdSessionState.STATUS_WAITING_SMS_BALANCE) return
 
         val allText = StringBuilder()
         collectText(root, allText)
@@ -116,6 +142,24 @@ class UssdAccessibilityService : AccessibilityService() {
             }
             return
         } else {
+            val looksLikeBalanceViaSms = BALANCE_VIA_SMS_PATTERN.containsMatchIn(text) &&
+                !RECHARGE_NOTIFICATION_EXCLUSIONS.containsMatchIn(text)
+
+            if (looksLikeBalanceViaSms) {
+                // إشعار فقط - الرصيد الفعلي سيصل عبر SMS منفصلة، لا نعتبر هذا نهائياً بعد
+                UssdSessionState.status = UssdSessionState.STATUS_WAITING_SMS_BALANCE
+                ActivityLog.add("رد USSD (إشعار رصيد عبر SMS): $text — بانتظار الرسالة حتى ${BALANCE_SMS_WAIT_MS / 1000} ثانية")
+
+                val dismissButton = findDismissButton(root)
+                if (dismissButton != null) {
+                    val clicked = dismissButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    ActivityLog.add(if (clicked) "تم إغلاق حوار الإشعار تلقائياً (بانتظار وصول الرصيد عبر SMS)" else "تعذّر النقر التلقائي على زر إغلاق الإشعار")
+                }
+
+                startBalanceSmsWait()
+                return
+            }
+
             // نهائي
             UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
             UssdSessionState.message = text
@@ -129,6 +173,79 @@ class UssdAccessibilityService : AccessibilityService() {
                 ActivityLog.add("تم استخراج الرد؛ بانتظار توفر زر إغلاق مناسب")
             }
         }
+    }
+
+    /**
+     * يبدأ انتظاراً في خيط خلفي لرسالة SMS جديدة تحمل قيمة الرصيد (بعد إشعار "الرصيد سيصل عبر SMS")،
+     * لمدة أقصاها BALANCE_SMS_WAIT_MS. عند الوصول أو انتهاء المهلة، يضع الحالة النهائية COMPLETED
+     * برسالة تحتوي على القيمة المستخرَجة (أو رسالة توضح عدم الوصول).
+     */
+    private fun startBalanceSmsWait() {
+        val waitStartMs = System.currentTimeMillis()
+        val requestIdAtStart = UssdSessionState.currentRequestId
+
+        Thread {
+            try {
+                val deadline = waitStartMs + BALANCE_SMS_WAIT_MS
+                while (System.currentTimeMillis() < deadline) {
+                    // إن انتهت الجلسة أو بدأت جلسة أخرى أثناء انتظارنا (مثلاً طلب إلغاء من C#)، توقف فوراً
+                    if (UssdSessionState.currentRequestId != requestIdAtStart) return@Thread
+
+                    val newSmsBody = findNewSmsSince(waitStartMs)
+                    if (newSmsBody != null) {
+                        val balance = extractBalanceValue(newSmsBody)
+                        val finalMessage = if (balance != null)
+                            "الرصيد: $balance (نص رسالة موبيليس: $newSmsBody)"
+                        else
+                            "وصلت رسالة SMS لكن تعذّر استخراج قيمة الرصيد منها تلقائياً - النص الكامل: $newSmsBody"
+
+                        ActivityLog.add("رد USSD (نهائي - رصيد عبر SMS): $finalMessage")
+                        UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
+                        UssdSessionState.message = finalMessage
+                        return@Thread
+                    }
+
+                    Thread.sleep(SMS_POLL_INTERVAL_MS)
+                }
+
+                if (UssdSessionState.currentRequestId != requestIdAtStart) return@Thread
+
+                val timeoutMessage = "لم تصل رسالة الرصيد عبر SMS خلال ${BALANCE_SMS_WAIT_MS / 1000} ثانية."
+                ActivityLog.add("رد USSD (نهائي - مهلة انتظار الرصيد): $timeoutMessage")
+                UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
+                UssdSessionState.message = timeoutMessage
+            } catch (e: Exception) {
+                ActivityLog.add("خطأ أثناء انتظار رسالة الرصيد: ${e.message}")
+                if (UssdSessionState.currentRequestId == requestIdAtStart) {
+                    UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
+                    UssdSessionState.message = "خطأ أثناء انتظار رسالة الرصيد: ${e.message}"
+                }
+            }
+        }.start()
+    }
+
+    /** يُرجع نص أحدث رسالة SMS في الوارد إن كان تاريخها بعد sinceMs، أو null إن لم توجد رسالة جديدة. */
+    private fun findNewSmsSince(sinceMs: Long): String? {
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_SMS)
+            != PackageManager.PERMISSION_GRANTED) {
+            return null
+        }
+        return try {
+            val uri = Uri.parse("content://sms/inbox")
+            contentResolver.query(uri, arrayOf("body", "date"), null, null, "date DESC LIMIT 1")?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val date = cursor.getLong(1)
+                    if (date > sinceMs) cursor.getString(0) else null
+                } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun extractBalanceValue(smsBody: String): String? {
+        val match = BALANCE_VALUE_PATTERN.find(smsBody) ?: return null
+        return "${match.groupValues[1]} ${match.groupValues[2].uppercase()}"
     }
 
     private fun applyPendingActions(root: AccessibilityNodeInfo) {
