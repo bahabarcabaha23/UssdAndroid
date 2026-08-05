@@ -12,6 +12,10 @@ object UssdSessionState {
     const val STATUS_PENDING = "PENDING"
     const val STATUS_WAITING_USER_INPUT = "WAITING_USER_INPUT"
     const val STATUS_COMPLETED = "COMPLETED"
+    // حالة وسيطة: رد الـ USSD وصل وكان مجرد إشعار بأن الرصيد سيصل عبر SMS منفصلة - الجلسة تبقى
+    // نشطة (غير IDLE) بانتظار تلك الرسالة. لا تُطابق شرط C# الخاص بـ COMPLETED/WAITING_USER_INPUT
+    // عمداً، فيستمر برنامج السي شارب بالاستقصاء بصبر دون إرسال أي إدخال إضافي عبثاً.
+    const val STATUS_WAITING_SMS_BALANCE = "WAITING_SMS_BALANCE"
 
     @Volatile var currentRequestId: String? = null
     @Volatile var status: String = STATUS_IDLE
