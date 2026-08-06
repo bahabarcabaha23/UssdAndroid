@@ -57,6 +57,14 @@ class UssdAccessibilityService : AccessibilityService() {
 
         private const val BALANCE_SMS_WAIT_MS = 40_000L
         private const val SMS_POLL_INTERVAL_MS = 2_000L
+
+        // 🛡️ حزمة "android" عامة جداً وتُستخدم أيضاً لنوافذ الأذونات وتنبيهات النظام العادية
+        // (غير متعلقة بالـ USSD إطلاقاً). نقبل نوافذ هذه الحزمة فقط إن لم تحتوِ إحدى هذه الكلمات
+        // الدالة على نوافذ أذونات/إعدادات شائعة، لتفادي نقر تلقائي غير مقصود على نافذة نظام أخرى.
+        private val SYSTEM_DIALOG_EXCLUSION_KEYWORDS = listOf(
+            "permission", "allow", "deny", "settings",
+            "إذن", "أذونات", "السماح", "رفض", "الإعدادات", "الوصول إلى"
+        )
     }
 
     override fun onCreate() {
@@ -93,12 +101,7 @@ class UssdAccessibilityService : AccessibilityService() {
 
         // 🛡️ فلترة الأمان: التأكد من أن النافذة تنتمي للنظام أو تطبيق الاتصال
         val currentPackageName = root.packageName?.toString()?.lowercase() ?: ""
-        val isTelephonyPackage = currentPackageName.contains("telephony") || 
-                                 currentPackageName.contains("phone") || 
-                                 currentPackageName.contains("server.telecom") ||
-                                 currentPackageName == "android"
-
-        if (!isTelephonyPackage) {
+        if (!isTelephonyRelatedWindow(root, currentPackageName)) {
             return // تجاهل أي نافذة لا تتعلق بالاتصالات
         }
 
@@ -108,6 +111,30 @@ class UssdAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             ActivityLog.add("خطأ أثناء قراءة نافذة USSD: ${e.message}")
         }
+    }
+
+    /**
+     * يحدد إن كانت النافذة تتبع فعلاً لتطبيق الهاتف/الاتصالات. الحزم التي تحتوي "telephony" أو
+     * "phone" أو "server.telecom" تُقبل مباشرة. أما حزمة "android" العامة فتُقبل فقط إن كان نصها
+     * لا يحتوي كلمات دالة على نوافذ أذونات أو إعدادات شائعة - هذه الحزمة تُستخدم لأشياء كثيرة غير
+     * متعلقة بالـ USSD إطلاقاً، وقبولها دون تحفظ قد يجعل الخدمة تنقر تلقائياً على زر في نافذة نظام
+     * لا علاقة لها بالموضوع.
+     */
+    private fun isTelephonyRelatedWindow(root: AccessibilityNodeInfo, packageName: String): Boolean {
+        val isKnownTelephonyPackage = packageName.contains("telephony") ||
+            packageName.contains("phone") ||
+            packageName.contains("server.telecom")
+        if (isKnownTelephonyPackage) return true
+
+        if (packageName == "android") {
+            val quickText = StringBuilder()
+            collectText(root, quickText)
+            val lower = quickText.toString().lowercase()
+            val looksLikeUnrelatedSystemDialog = SYSTEM_DIALOG_EXCLUSION_KEYWORDS.any { lower.contains(it) }
+            return !looksLikeUnrelatedSystemDialog
+        }
+
+        return false
     }
 
     private fun handlePossibleUssdDialog(root: AccessibilityNodeInfo) {
@@ -136,8 +163,7 @@ class UssdAccessibilityService : AccessibilityService() {
         if (hasInputField) {
             // بانتظار إدخال
             if (UssdSessionState.status != UssdSessionState.STATUS_WAITING_USER_INPUT || UssdSessionState.message != text) {
-                UssdSessionState.status = UssdSessionState.STATUS_WAITING_USER_INPUT
-                UssdSessionState.message = text
+                UssdSessionState.updateStatus(UssdSessionState.STATUS_WAITING_USER_INPUT, text)
                 ActivityLog.add("رد USSD (بانتظار إدخال): $text")
             }
             return
@@ -147,7 +173,7 @@ class UssdAccessibilityService : AccessibilityService() {
 
             if (looksLikeBalanceViaSms) {
                 // إشعار فقط - الرصيد الفعلي سيصل عبر SMS منفصلة، لا نعتبر هذا نهائياً بعد
-                UssdSessionState.status = UssdSessionState.STATUS_WAITING_SMS_BALANCE
+                UssdSessionState.updateStatus(UssdSessionState.STATUS_WAITING_SMS_BALANCE)
                 ActivityLog.add("رد USSD (إشعار رصيد عبر SMS): $text — بانتظار الرسالة حتى ${BALANCE_SMS_WAIT_MS / 1000} ثانية")
 
                 val dismissButton = findDismissButton(root)
@@ -161,8 +187,7 @@ class UssdAccessibilityService : AccessibilityService() {
             }
 
             // نهائي
-            UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
-            UssdSessionState.message = text
+            UssdSessionState.updateStatus(UssdSessionState.STATUS_COMPLETED, text)
             ActivityLog.add("رد USSD (نهائي): $text")
 
             val dismissButton = findDismissButton(root)
@@ -200,8 +225,7 @@ class UssdAccessibilityService : AccessibilityService() {
                             "وصلت رسالة SMS لكن تعذّر استخراج قيمة الرصيد منها تلقائياً - النص الكامل: $newSmsBody"
 
                         ActivityLog.add("رد USSD (نهائي - رصيد عبر SMS): $finalMessage")
-                        UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
-                        UssdSessionState.message = finalMessage
+                        UssdSessionState.updateStatus(UssdSessionState.STATUS_COMPLETED, finalMessage)
                         return@Thread
                     }
 
@@ -212,19 +236,22 @@ class UssdAccessibilityService : AccessibilityService() {
 
                 val timeoutMessage = "لم تصل رسالة الرصيد عبر SMS خلال ${BALANCE_SMS_WAIT_MS / 1000} ثانية."
                 ActivityLog.add("رد USSD (نهائي - مهلة انتظار الرصيد): $timeoutMessage")
-                UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
-                UssdSessionState.message = timeoutMessage
+                UssdSessionState.updateStatus(UssdSessionState.STATUS_COMPLETED, timeoutMessage)
             } catch (e: Exception) {
                 ActivityLog.add("خطأ أثناء انتظار رسالة الرصيد: ${e.message}")
                 if (UssdSessionState.currentRequestId == requestIdAtStart) {
-                    UssdSessionState.status = UssdSessionState.STATUS_COMPLETED
-                    UssdSessionState.message = "خطأ أثناء انتظار رسالة الرصيد: ${e.message}"
+                    UssdSessionState.updateStatus(UssdSessionState.STATUS_COMPLETED, "خطأ أثناء انتظار رسالة الرصيد: ${e.message}")
                 }
             }
         }.start()
     }
 
-    /** يُرجع نص أحدث رسالة SMS في الوارد إن كان تاريخها بعد sinceMs، أو null إن لم توجد رسالة جديدة. */
+    /**
+     * يُرجع نص أحدث رسالة SMS في الوارد إن كان تاريخها بعد sinceMs **وتحتوي فعلاً على نمط قيمة رصيد**
+     * (مبلغ متبوع بـ DA/دج)، أو null إن لم توجد رسالة كهذه بعد. لا نكتفي بكون الرسالة "الأحدث" لأن أي
+     * رسالة أخرى غير متعلقة (إشعار تطبيق، رسالة عادية) قد تصل خلال نافذة الانتظار قبل رسالة الرصيد
+     * الفعلية؛ رسالة كهذه ستُتجاهل هنا وتستمر الحلقة بالانتظار حتى تصل رسالة تطابق النمط فعلاً أو تنتهي المهلة.
+     */
     private fun findNewSmsSince(sinceMs: Long): String? {
         if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_SMS)
             != PackageManager.PERMISSION_GRANTED) {
@@ -235,7 +262,8 @@ class UssdAccessibilityService : AccessibilityService() {
             contentResolver.query(uri, arrayOf("body", "date"), null, null, "date DESC LIMIT 1")?.use { cursor ->
                 if (cursor.moveToFirst()) {
                     val date = cursor.getLong(1)
-                    if (date > sinceMs) cursor.getString(0) else null
+                    val body = cursor.getString(0)
+                    if (date > sinceMs && body != null && BALANCE_VALUE_PATTERN.containsMatchIn(body)) body else null
                 } else null
             }
         } catch (e: Exception) {
@@ -267,7 +295,9 @@ class UssdAccessibilityService : AccessibilityService() {
                     ActivityLog.add("[إدخال] نتيجة الضغط على زر الإرسال: $clickSuccess")
 
                     if (clickSuccess) {
-                        UssdSessionState.status = UssdSessionState.STATUS_PENDING
+                        // updateStatus تُعيد جدولة مهلة PENDING تلقائياً، فلو لم يصل أي رد بعد إرسال
+                        // هذا الإدخال أيضاً، لن تبقى الجلسة عالقة إلى الأبد.
+                        UssdSessionState.updateStatus(UssdSessionState.STATUS_PENDING)
                     }
                 } else if (sendBtn == null) {
                     ActivityLog.add("[إدخال] فشل: لم يُعثر على زر الإرسال (ENVOYER)")
