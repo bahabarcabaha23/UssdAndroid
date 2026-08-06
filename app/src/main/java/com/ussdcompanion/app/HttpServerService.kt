@@ -31,6 +31,13 @@ class HttpServerService : Service() {
         val port = prefs.getInt(Prefs.PORT, 8080)
         val apiKey = prefs.getString(Prefs.API_KEY, "") ?: ""
 
+        if (apiKey.isEmpty()) {
+            ActivityLog.add(
+                "⚠️ تحذير أمني: لم يُضبط مفتاح API - الخادم المحلي سيعمل بلا أي مصادقة على " +
+                    "X-API-Key. يُنصح بضبط مفتاح من الإعدادات قبل الاستخدام الفعلي."
+            )
+        }
+
         server = LocalServer(applicationContext, port, apiKey)
         try {
             server?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
@@ -131,22 +138,21 @@ class HttpServerService : Service() {
                 return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "code is required"))
             }
 
-            // ابحث عن هذا الشرط داخل handleUssdSend:
-if (existingSessionId != null &&
-    existingSessionId == UssdSessionState.currentRequestId &&
-    UssdSessionState.status == UssdSessionState.STATUS_WAITING_USER_INPUT) {
+            // استكمال جلسة قائمة بانتظار إدخال المستخدم (مثلاً كود PIN/تأكيد بعد أول خطوة USSD)
+            if (existingSessionId != null &&
+                existingSessionId == UssdSessionState.currentRequestId &&
+                UssdSessionState.status == UssdSessionState.STATUS_WAITING_USER_INPUT
+            ) {
+                ActivityLog.add("[HTTP] تم استقبال كود التأكيد/المتابعة: $code للجلسة: $existingSessionId")
 
-    // 🟢 1. أضف سطر اللوق هنا:
-    ActivityLog.add("[HTTP] تم استقبال كود التأكيد/المتابعة: $code للجلسة: $existingSessionId")
+                UssdSessionState.pendingInputToSend.set(code)
 
-    UssdSessionState.pendingInputToSend.set(code)
+                // استدعاء مباشر لخدمة الوصول لتنفيذ الإدخال فوراً دون انتظار حدث تغيّر شاشة جديد
+                UssdAccessibilityService.instance?.performPendingActionsDirectly()
+                    ?: ActivityLog.add("[HTTP] تنبيه: UssdAccessibilityService غير متوفرة!")
 
-    // 🟢 2. أضف الاستدعاء المباشر لخدمة الوصول هنا فوراً بعد وضع الكود:
-    UssdAccessibilityService.instance?.performPendingActionsDirectly() 
-        ?: ActivityLog.add("[HTTP] تنبيه: UssdAccessibilityService غير متوفرة!")
-
-    return jsonResponse(Response.Status.OK, JSONObject().put("requestId", existingSessionId))
-}
+                return jsonResponse(Response.Status.OK, JSONObject().put("requestId", existingSessionId))
+            }
 
             if (UssdSessionState.status != UssdSessionState.STATUS_IDLE) {
                 return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "device busy"))
@@ -159,11 +165,16 @@ if (existingSessionId != null &&
             dialIntent.data = Uri.parse("tel:" + Uri.encode(code))
             dialIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
 
-            // إن أُرسل simSlot مع الطلب، نحدد الشريحة برمجياً فلا تظهر نافذة الاختيار إطلاقاً
+            // إن أُرسل simSlot مع الطلب، نحدد الشريحة برمجياً فلا تظهر نافذة الاختيار إطلاقاً.
+            // resolvePhoneAccountForSlot ترفض التخمين الترتيبي افتراضياً (allowOrdinalFallback=false)؛
+            // عند تعذّر مطابقة دقيقة نترك handle فارغاً عمداً بدل خطر إرسال USSD من شريحة خاطئة -
+            // في هذه الحالة سيعرض أندرويد نافذة اختيار الشريحة الافتراضية بدل الاختيار الصامت.
             if (simSlot != -1) {
                 val handle = SimSelector.resolvePhoneAccountForSlot(context, simSlot)
                 if (handle != null) {
                     dialIntent.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
+                } else {
+                    ActivityLog.add("[HTTP] تعذّر تحديد شريحة $simSlot تلقائياً بثقة - سيُترك الاختيار لنافذة أندرويد الافتراضية")
                 }
             }
 
@@ -200,7 +211,7 @@ if (existingSessionId != null &&
             if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
                 return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "READ_SMS permission not granted"))
             }
-            val limit = session.parms["limit"]?.toIntOrNull() ?: 10
+            val limit = (session.parms["limit"]?.toIntOrNull() ?: 10).coerceIn(1, 100)
             val list = JSONArray()
             val uri = Uri.parse("content://sms/inbox")
             val cursor: Cursor? = context.contentResolver.query(
