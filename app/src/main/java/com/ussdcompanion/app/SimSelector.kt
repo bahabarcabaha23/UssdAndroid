@@ -6,7 +6,7 @@ import android.os.Build
 
 object SimSelector {
     fun getSubscriptionId(context: Context, simSlot: Int): Int? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Lollipop_MR1) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP_MR1) return null
         try {
             val sm = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
             val infoList = sm?.activeSubscriptionInfoList
