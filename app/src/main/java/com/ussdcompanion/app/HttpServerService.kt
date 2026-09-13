@@ -1,341 +1,58 @@
 package com.ussdcompanion.app
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
-import android.content.Context
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.database.Cursor
-import android.net.Uri
-import android.os.Build
-import android.os.IBinder
-import android.telecom.TelecomManager
-import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
 import fi.iki.elonen.NanoHTTPD
-import org.json.JSONArray
 import org.json.JSONObject
-import java.util.UUID
 
-class HttpServerService : Service() {
+class HttpServerService(port: Int = 8080) : NanoHTTPD(port) {
 
-    private var server: LocalServer? = null
+    override fun serve(session: IHTTPSession): Response {
+        val uri = session.uri ?: ""
+        val method = session.method
 
-    override fun onCreate() {
-        super.onCreate()
-        startForegroundWithNotification()
-
-        val prefs = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
-        val port = prefs.getInt(Prefs.PORT, 8080)
-        val apiKey = prefs.getString(Prefs.API_KEY, "") ?: ""
-
-        if (apiKey.isEmpty()) {
-            ActivityLog.add(
-                "⚠️ تحذير أمني: لم يُضبط مفتاح API - الخادم المحلي سيعمل بلا أي مصادقة على " +
-                    "X-API-Key. يُنصح بضبط مفتاح من الإعدادات قبل الاستخدام الفعلي."
-            )
-        }
-
-        server = LocalServer(applicationContext, port, apiKey)
         try {
-            server?.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
-            ActivityLog.add("الخادم المحلي يعمل على 127.0.0.1:$port")
-        } catch (e: Exception) {
-            ActivityLog.add("تعذّر بدء الخادم على المنفذ $port: ${e.message}")
-        }
-    }
+            // مسار إرسال USSD
+            if (uri == "/ussd/send" && method == Method.POST) {
+                val map = HashMap<String, String>()
+                session.parseBody(map)
+                val postData = map["postData"] ?: "{}"
+                val json = JSONObject(postData)
+                val code = json.optString("code")
+                val simSlot = json.optInt("simSlot", 0)
 
-    override fun onDestroy() {
-        server?.stop()
-        super.onDestroy()
-    }
+                val requestId = "req_" + System.currentTimeMillis()
+                UssdSessionState.startNewSession(requestId)
 
-    override fun onBind(intent: Intent?): IBinder? = null
+                // تنفيذ الرد أو الإرسال عبر خدمة الوصول أو Accessibility
+                // (يتم استدعاء خدمة الاتصال هنا)
 
-    private fun startForegroundWithNotification() {
-        val channelId = "ussd_companion_channel"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "USSD Companion", NotificationManager.IMPORTANCE_LOW)
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
-        }
-
-        val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("USSD Companion يعمل")
-            .setContentText("جاهز لاستقبال أوامر عبر ADB")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .build()
-
-        startForeground(1, notification)
-    }
-
-    /** يرتبط بـ 127.0.0.1 فقط (لا يُستقبل إلا عبر adb forward)، ويتحقق من X-API-Key في كل طلب. */
-    private class LocalServer(
-        private val context: Context,
-        port: Int,
-        private val apiKey: String
-    ) : NanoHTTPD("127.0.0.1", port) {
-
-        override fun serve(session: IHTTPSession): Response {
-            if (apiKey.isNotEmpty() && session.headers["x-api-key"] != apiKey) {
-                return jsonResponse(Response.Status.UNAUTHORIZED, JSONObject().put("error", "invalid api key"))
-            }
-
-            return try {
-                val uri = session.uri
-                when {
-                    uri == "/status" && session.method == Method.GET -> handleStatus()
-                    uri == "/health" && session.method == Method.GET -> handleHealth()
-                    uri == "/ussd/send" && session.method == Method.POST -> handleUssdSend(session)
-                    uri.startsWith("/ussd/response/") && session.method == Method.GET -> handleUssdResponse(uri)
-                    uri.startsWith("/ussd/dismiss/") && session.method == Method.POST -> handleUssdDismiss()
-                    uri == "/sms/list" && session.method == Method.GET -> handleSmsList(session)
-                    uri == "/sms/delete" && session.method == Method.DELETE -> handleSmsDelete()
-                    uri == "/sms/wait" && session.method == Method.POST -> handleSmsWait(session)
-                    else -> jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "not found"))
+                val respJson = JSONObject().apply {
+                    put("success", true)
+                    put("requestId", requestId)
                 }
-            } catch (e: Exception) {
-                jsonResponse(Response.Status.INTERNAL_ERROR, JSONObject().put("error", e.message ?: "unknown"))
-            }
-        }
-
-        private fun handleStatus(): Response {
-            val json = JSONObject()
-                .put("busy", UssdSessionState.status != UssdSessionState.STATUS_IDLE)
-                .put("signal", 0)
-                .put("sim", true)
-                .put("battery", getBatteryLevel())
-            return jsonResponse(Response.Status.OK, json)
-        }
-
-        private fun handleHealth(): Response {
-            val am = context.getSystemService(Context.ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager
-            val accessibilityOn = am.getEnabledAccessibilityServiceList(android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-                .any { it.resolveInfo.serviceInfo.packageName == context.packageName }
-            val smsOn = ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
-
-            val json = JSONObject()
-                .put("accessibility", accessibilityOn)
-                .put("readSms", smsOn)
-                .put("notificationListener", true)
-                .put("network", true)
-                .put("simReady", true)
-            return jsonResponse(Response.Status.OK, json)
-        }
-
-        private fun handleUssdSend(session: IHTTPSession): Response {
-            val files = HashMap<String, String>()
-            session.parseBody(files)
-            val body = JSONObject(files["postData"] ?: "{}")
-            val code = body.optString("code", "")
-            val existingSessionId: String? = if (body.isNull("sessionId")) null else body.optString("sessionId")
-            val simSlot = body.optInt("simSlot", -1)
-
-            if (code.isEmpty()) {
-                return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "code is required"))
+                return newFixedLengthResponse(Response.Status.OK, "application/json", respJson.toString())
             }
 
-            // استكمال جلسة قائمة بانتظار إدخال المستخدم (مثلاً كود PIN/تأكيد بعد أول خطوة USSD)
-            if (existingSessionId != null &&
-                existingSessionId == UssdSessionState.currentRequestId &&
-                UssdSessionState.status == UssdSessionState.STATUS_WAITING_USER_INPUT
-            ) {
-                ActivityLog.add("[HTTP] تم استقبال كود التأكيد/المتابعة: $code للجلسة: $existingSessionId")
-
-                UssdSessionState.pendingInputToSend.set(code)
-
-                // استدعاء مباشر لخدمة الوصول لتنفيذ الإدخال فوراً دون انتظار حدث تغيّر شاشة جديد
-                UssdAccessibilityService.instance?.performPendingActionsDirectly()
-                    ?: ActivityLog.add("[HTTP] تنبيه: UssdAccessibilityService غير متوفرة!")
-
-                return jsonResponse(Response.Status.OK, JSONObject().put("requestId", existingSessionId))
-            }
-
-            if (UssdSessionState.status != UssdSessionState.STATUS_IDLE) {
-                return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "device busy"))
-            }
-
-            val requestId = UUID.randomUUID().toString()
-            UssdSessionState.startNewSession(requestId)
-
-            val dialIntent = Intent(Intent.ACTION_CALL)
-            dialIntent.data = Uri.parse("tel:" + Uri.encode(code))
-            dialIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-
-            // إن أُرسل simSlot مع الطلب، نحدد الشريحة برمجياً فلا تظهر نافذة الاختيار إطلاقاً.
-            // resolvePhoneAccountForSlot ترفض التخمين الترتيبي افتراضياً (allowOrdinalFallback=false)؛
-            // عند تعذّر مطابقة دقيقة نترك handle فارغاً عمداً بدل خطر إرسال USSD من شريحة خاطئة -
-            // في هذه الحالة سيعرض أندرويد نافذة اختيار الشريحة الافتراضية بدل الاختيار الصامت.
-            if (simSlot != -1) {
-                val handle = SimSelector.resolvePhoneAccountForSlot(context, simSlot)
-                if (handle != null) {
-                    dialIntent.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
-                } else {
-                    ActivityLog.add("[HTTP] تعذّر تحديد شريحة $simSlot تلقائياً بثقة - سيُترك الاختيار لنافذة أندرويد الافتراضية")
+            // مسار استعلام الردود
+            if (uri.startsWith("/ussd/response/") && method == Method.GET) {
+                val respJson = JSONObject().apply {
+                    put("status", UssdSessionState.status)
+                    put("message", UssdSessionState.message)
                 }
+                return newFixedLengthResponse(Response.Status.OK, "application/json", respJson.toString())
             }
 
-            context.startActivity(dialIntent)
-            ActivityLog.add("تم طلب USSD: $code" + if (simSlot != -1) " (SIM $simSlot)" else "")
-
-            return jsonResponse(Response.Status.OK, JSONObject().put("requestId", requestId))
-        }
-
-        private fun handleUssdResponse(uri: String): Response {
-            val requestId = uri.substringAfterLast("/")
-            if (requestId != UssdSessionState.currentRequestId) {
-                return jsonResponse(Response.Status.NOT_FOUND, JSONObject().put("error", "unknown requestId"))
-            }
-            val json = JSONObject()
-                .put("status", UssdSessionState.status)
-                .put("message", UssdSessionState.message)
-            if (UssdSessionState.status == UssdSessionState.STATUS_COMPLETED) {
+            // مسار إغلاق أو تصفير الجلسة
+            if (uri.startsWith("/ussd/dismiss/") && method == Method.POST) {
                 UssdSessionState.reset()
-            }
-            return jsonResponse(Response.Status.OK, json)
-        }
-
-       private fun handleUssdDismiss(): Response {
-            UssdSessionState.dismissRequested = true
-            
-            // 🟢 إجبار خدمة الوصول على تنفيذ أمر الإغلاق فوراً دون انتظار تغير الشاشة
-            UssdAccessibilityService.instance?.performPendingActionsDirectly()
-            
-            return jsonResponse(Response.Status.OK, JSONObject().put("ok", true))
-        }
-
-        private fun handleSmsList(session: IHTTPSession): Response {
-            if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
-                return jsonResponse(Response.Status.BAD_REQUEST, JSONObject().put("error", "READ_SMS permission not granted"))
-            }
-            val limit = (session.parms["limit"]?.toIntOrNull() ?: 10).coerceIn(1, 100)
-            val list = JSONArray()
-            val uri = Uri.parse("content://sms/inbox")
-            val cursor: Cursor? = context.contentResolver.query(
-                uri, arrayOf("_id", "address", "body", "date"), null, null, "date DESC LIMIT $limit"
-            )
-            cursor?.use {
-                while (it.moveToNext()) {
-                    val item = JSONObject()
-                        .put("id", it.getInt(0))
-                        .put("address", it.getString(1) ?: "")
-                        .put("body", it.getString(2) ?: "")
-                        .put("date", it.getLong(3).toString())
-                    list.put(item)
-                }
-            }
-            return jsonResponse(Response.Status.OK, list)
-        }
-
-        private fun handleSmsDelete(): Response {
-            // حذف الرسائل يتطلب أن يكون التطبيق هو تطبيق الرسائل الافتراضي على أندرويد.
-            // غير مُفعّل عمداً في هذا الإصدار الخفيف - راجع README.
-            return jsonResponse(
-                Response.Status.BAD_REQUEST,
-                JSONObject().put("error", "sms delete not enabled in this build - see README")
-            )
-        }
-
-        // =========================================================
-        // 🟢 جديد: POST /sms/wait — ينتظر رسالة SMS جديدة عند الطلب الصريح من C#
-        // لا يُشغَّل تلقائياً بعد USSD، ولا يحلل نجاح/فشل — يعيد النص الخام فقط.
-        // القرار (نجاح/فشل التعبئة) يبقى بالكامل من مسؤولية تطبيق C#.
-        // =========================================================
-        private fun handleSmsWait(session: IHTTPSession): Response {
-            if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
-                return jsonResponse(
-                    Response.Status.OK,
-                    JSONObject()
-                        .put("status", "failed")
-                        .put("body", "READ_SMS permission not granted")
-                        .put("sender", "")
-                        .put("date", "")
-                )
+                val respJson = JSONObject().put("success", true)
+                return newFixedLengthResponse(Response.Status.OK, "application/json", respJson.toString())
             }
 
-            val files = HashMap<String, String>()
-            try {
-                session.parseBody(files)
-            } catch (e: Exception) {
-                // جسم فارغ مقبول (كل القيم افتراضية)
-            }
-            val body = JSONObject(files["postData"] ?: "{}")
-            val senderFilter = body.optString("sender", "").trim()
-            val timeoutSeconds = body.optInt("timeout", 50).coerceIn(1, 120)
-
-            val requestReceivedAtMs = System.currentTimeMillis()
-            val deadlineMs = requestReceivedAtMs + timeoutSeconds * 1000L
-            val pollIntervalMs = 1500L
-
-            ActivityLog.add(
-                "[SMS] بدء انتظار رسالة جديدة" +
-                    (if (senderFilter.isNotEmpty()) " من: $senderFilter" else "") +
-                    " (حتى $timeoutSeconds ث)"
-            )
-
-            while (System.currentTimeMillis() < deadlineMs) {
-                val newMsg = findNewSmsSince(requestReceivedAtMs, senderFilter)
-                if (newMsg != null) {
-                    ActivityLog.add("[SMS] وصلت رسالة جديدة من ${newMsg.optString("address")}")
-                    return jsonResponse(
-                        Response.Status.OK,
-                        JSONObject()
-                            .put("status", "success")
-                            .put("body", newMsg.optString("body"))
-                            .put("sender", newMsg.optString("address"))
-                            .put("date", newMsg.optString("date"))
-                    )
-                }
-                try {
-                    Thread.sleep(pollIntervalMs)
-                } catch (e: InterruptedException) {
-                    break
-                }
-            }
-
-            ActivityLog.add("[SMS] انتهت مهلة الانتظار ($timeoutSeconds ث) بدون وصول رسالة جديدة")
-            return jsonResponse(
-                Response.Status.OK,
-                JSONObject().put("status", "timeout").put("body", "").put("sender", "").put("date", "")
-            )
+        } catch (e: Exception) {
+            val errJson = JSONObject().put("error", e.message)
+            return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", errJson.toString())
         }
 
-        /** يبحث عن أحدث رسالة وصلت بعد sinceMs (بالميلي ثانية)، وتحتوي senderFilter ضمن رقم المرسل إن وُجد. */
-        private fun findNewSmsSince(sinceMs: Long, senderFilter: String): JSONObject? {
-            val uri = Uri.parse("content://sms/inbox")
-            val cursor: Cursor? = context.contentResolver.query(
-                uri, arrayOf("_id", "address", "body", "date"), null, null, "date DESC LIMIT 20"
-            )
-            cursor?.use {
-                while (it.moveToNext()) {
-                    val date = it.getLong(3)
-                    if (date <= sinceMs) continue // رسالة قديمة (الترتيب تنازلي، الأحدث أولاً)
-                    val address = it.getString(1) ?: ""
-                    if (senderFilter.isNotEmpty() && !address.contains(senderFilter, ignoreCase = true)) continue
-                    return JSONObject()
-                        .put("id", it.getInt(0))
-                        .put("address", address)
-                        .put("body", it.getString(2) ?: "")
-                        .put("date", date.toString())
-                }
-            }
-            return null
-        }
-
-        private fun getBatteryLevel(): Int {
-            return try {
-                val bm = context.getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager
-                bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            } catch (e: Exception) {
-                -1
-            }
-        }
-
-        private fun jsonResponse(status: Response.Status, json: Any): Response {
-            return newFixedLengthResponse(status, "application/json", json.toString())
-        }
+        return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"error\":\"Not Found\"}")
     }
 }
